@@ -31,7 +31,6 @@
 #include <linux/fb.h>
 #include "qdMetaData.h"
 #include <overlayUtils.h>
-#include <cutils/sockets.h>
 
 #define ALIGN_TO(x, align)     (((x) + ((align)-1)) & ~((align)-1))
 #define LIKELY( exp )       (__builtin_expect( (exp) != 0, true  ))
@@ -39,7 +38,6 @@
 #define MAX_NUM_APP_LAYERS 32
 #define MAX_DISPLAY_DIM 2048
 
-#define DAEMON_SOCKET "pps"
 //Fwrd decls
 struct hwc_context_t;
 
@@ -60,6 +58,7 @@ class IFBUpdate;
 class IVideoOverlay;
 class MDPComp;
 class CopyBit;
+class HwcDebug;
 
 
 struct MDPInfo {
@@ -88,6 +87,8 @@ struct DisplayAttributes {
     bool isConfiguring;
     // External Display is in MDP Downscale mode indicator
     bool mDownScaleMode;
+    // Ext dst Rect
+    hwc_rect_t mDstRect;
 };
 
 struct ListStats {
@@ -117,14 +118,6 @@ struct VsyncState {
     bool fakevsync;
 };
 
-struct CablProp {
-    bool enabled;
-    bool start;
-    bool videoOnly;
-    //daemon_socket for connection to pp-daemon
-    int daemon_socket;
-};
-
 // LayerProp::flag values
 enum {
     HWC_MDPCOMP = 0x00000001,
@@ -136,7 +129,11 @@ public:
     LayerRotMap() { reset(); }
     enum { MAX_SESS = 3 };
     void add(hwc_layer_1_t* layer, overlay::Rotator *rot);
+    //Resets the mapping of layer to rotator
     void reset();
+    //Clears mappings and existing rotator fences
+    //Intended to be used during errors
+    void clear();
     uint32_t getCount() const;
     hwc_layer_1_t* getLayer(uint32_t index) const;
     overlay::Rotator* getRot(uint32_t index) const;
@@ -368,7 +365,7 @@ inline void swap(T& a, T& b) {
     a = b;
     b = tmp;
 }
-
+int getSocIdFromSystem();
 }; //qhwc namespace
 
 // -----------------------------------------------------------------------------
@@ -397,8 +394,8 @@ struct hwc_context_t {
     qhwc::ListStats listStats[HWC_NUM_DISPLAY_TYPES];
     qhwc::LayerProp *layerProp[HWC_NUM_DISPLAY_TYPES];
     qhwc::MDPComp *mMDPComp[HWC_NUM_DISPLAY_TYPES];
-    qhwc::CablProp mCablProp;
-    overlay::utils::Whf mPrevWHF[HWC_NUM_DISPLAY_TYPES];
+    qhwc::HwcDebug *mHwcDebug[HWC_NUM_DISPLAY_TYPES];
+    hwc_rect_t mViewFrame[HWC_NUM_DISPLAY_TYPES];
 
     // No animation on External display feature
     // Notifies hwcomposer about the device orientation before animation.
@@ -426,9 +423,11 @@ struct hwc_context_t {
     //Used for SideSync feature
     //which overrides the mExtOrientation
     bool mBufferMirrorMode;
-
+    //used for enabling C2D Feature only for 8960 Non Pro Device
+    int mSocId;
     qhwc::LayerRotMap *mLayerRotMap[HWC_NUM_DISPLAY_TYPES];
-
+    //previous Width & Height
+    overlay::utils::Whf mPrevWHF[HWC_NUM_DISPLAY_TYPES];
     // Panel reset flag will be set if BTA check fails
     bool mPanelResetStatus;
 };

@@ -30,6 +30,7 @@
 #include "hwc_fbupdate.h"
 #include "mdp_version.h"
 #include "hwc_copybit.h"
+#include "hwc_dump_layers.h"
 #include "external.h"
 #include "virtual.h"
 #include "hwc_qclient.h"
@@ -111,90 +112,6 @@ static int openFramebufferDevice(hwc_context_t *ctx)
     return 0;
 }
 
-static int ppdComm(const char* cmd, hwc_context_t *ctx) {
-    int ret = -1;
-    ret = send(ctx->mCablProp.daemon_socket, cmd, strlen(cmd), MSG_NOSIGNAL);
-    if(ret < 0) {
-        if (errno == EPIPE) {
-            //For broken pipe case, we will close the socket and
-            //re-establish the connection
-            close(ctx->mCablProp.daemon_socket);
-            int daemon_socket = socket_local_client(DAEMON_SOCKET,
-                    ANDROID_SOCKET_NAMESPACE_RESERVED,
-                    SOCK_STREAM);
-            if(!daemon_socket) {
-                ALOGE("Connecting to socket failed: %s", strerror(errno));
-                ctx->mCablProp.enabled = false;
-                return -1;
-            }
-            struct timeval timeout;
-            timeout.tv_sec = 1;//wait 1 second before timeout
-            timeout.tv_usec = 0;
-
-            if (setsockopt(daemon_socket, SOL_SOCKET, SO_SNDTIMEO,
-                        (char*)&timeout, sizeof(timeout )) < 0)
-                ALOGE("setsockopt failed");
-
-            ctx->mCablProp.daemon_socket = daemon_socket;
-            //resend the cmd after connection is re-established
-            ret = send(ctx->mCablProp.daemon_socket, cmd, strlen(cmd),
-                       MSG_NOSIGNAL);
-            if (ret < 0) {
-                ALOGE("Failed to send data over socket: %s",
-                        strerror(errno));
-                return ret;
-            }
-        } else {
-            ALOGE("Failed to send data over socket: %s",
-                    strerror(errno));
-            return ret;
-        }
-    }
-    ALOGD_IF(HWC_UTILS_DEBUG, "%s: Sent command: %s", __FUNCTION__, cmd);
-    return 0;
-}
-
-static void connectPPDaemon(hwc_context_t *ctx)
-{
-    int ret = -1;
-    char property[PROPERTY_VALUE_MAX];
-    if ((property_get("ro.qualcomm.cabl", property, NULL) > 0) &&
-        (atoi(property) == 1)) {
-        ALOGD("%s: CABL is enabled", __FUNCTION__);
-        ctx->mCablProp.enabled = true;
-    } else {
-        ALOGD("%s: CABL is disabled", __FUNCTION__);
-        ctx->mCablProp.enabled = false;
-        return;
-    }
-
-    if ((property_get("persist.qcom.cabl.video_only", property, NULL) > 0) &&
-        (atoi(property) == 1)) {
-        ALOGD("%s: CABL is in video only mode", __FUNCTION__);
-        ctx->mCablProp.videoOnly = true;
-    } else {
-        ctx->mCablProp.videoOnly = false;
-    }
-
-    int daemon_socket = socket_local_client(DAEMON_SOCKET,
-                                            ANDROID_SOCKET_NAMESPACE_RESERVED,
-                                            SOCK_STREAM);
-    if(!daemon_socket) {
-        ALOGE("Connecting to socket failed: %s", strerror(errno));
-        ctx->mCablProp.enabled = false;
-        return;
-    }
-    struct timeval timeout;
-    timeout.tv_sec = 1; //wait 1 second before timeout
-    timeout.tv_usec = 0;
-
-    if (setsockopt(daemon_socket, SOL_SOCKET, SO_SNDTIMEO,
-        (char*)&timeout, sizeof(timeout )) < 0)
-        ALOGE("setsockopt failed");
-
-    ctx->mCablProp.daemon_socket = daemon_socket;
-}
-
 void initContext(hwc_context_t *ctx)
 {
     if(openFramebufferDevice(ctx) < 0) {
@@ -206,7 +123,7 @@ void initContext(hwc_context_t *ctx)
     ctx->mMDP.panel = qdutils::MDPVersion::getInstance().getPanelType();
     overlay::Overlay::initOverlay();
     ctx->mOverlay = overlay::Overlay::getInstance();
-    ctx->mRotMgr = new RotMgr();
+    ctx->mRotMgr = RotMgr::getInstance();
 
     //Is created and destroyed only once for primary
     //For external it could get created and destroyed multiple times depending
@@ -247,6 +164,9 @@ void initContext(hwc_context_t *ctx)
         ctx->mLayerRotMap[i] = new LayerRotMap();
     }
 
+    for (uint32_t i = 0; i < HWC_NUM_DISPLAY_TYPES; i++) {
+        ctx->mHwcDebug[i] = new HwcDebug(i);
+    }
     MDPComp::init(ctx);
 
     ctx->vstate.enable = false;
@@ -269,13 +189,10 @@ void initContext(hwc_context_t *ctx)
     ctx->mPrevDestVideo.left = ctx->mPrevDestVideo.top =
         ctx->mPrevDestVideo.right = ctx->mPrevDestVideo.bottom = 0;
     ctx->mPrevTransformVideo = 0;
-
     ctx->mBufferMirrorMode = false;
-
+    ctx->mSocId = getSocIdFromSystem();
     ALOGI("Initializing Qualcomm Hardware Composer");
     ALOGI("MDP version: %d", ctx->mMDP.version);
-
-    connectPPDaemon(ctx);
 }
 
 void closeContext(hwc_context_t *ctx)
@@ -319,6 +236,10 @@ void closeContext(hwc_context_t *ctx)
         if(ctx->mLayerRotMap[i]) {
             delete ctx->mLayerRotMap[i];
             ctx->mLayerRotMap[i] = NULL;
+        }
+        if(ctx->mHwcDebug[i]) {
+            delete ctx->mHwcDebug[i];
+            ctx->mHwcDebug[i] = NULL;
         }
     }
 
@@ -708,25 +629,21 @@ bool isAlphaPresent(hwc_layer_1_t const* layer) {
     return false;
 }
 
-// Switch ppd on/off for YUV
-static void configurePPD(hwc_context_t *ctx, int yuvCount) {
-    if (!ctx->mCablProp.enabled)
-        return;
-
-    if (yuvCount > 0 && !ctx->mCablProp.start) {
-        ctx->mCablProp.start = true;
-        if(ctx->mCablProp.videoOnly)
-            ppdComm("cabl:on", ctx);
-        else
-            ppdComm("cabl:yuv_on", ctx);
-
-    } else if (yuvCount == 0 && ctx->mCablProp.start) {
-        ctx->mCablProp.start = false;
-        if(ctx->mCablProp.videoOnly)
-            ppdComm("cabl:off", ctx);
-        else
-            ppdComm("cabl:yuv_off", ctx);
-        return;
+// Let CABL know we have a YUV layer
+static void setYUVProp(int yuvCount) {
+    static char property[PROPERTY_VALUE_MAX];
+    if(yuvCount > 0) {
+        if (property_get("hw.cabl.yuv", property, NULL) > 0) {
+            if (atoi(property) != 1) {
+                property_set("hw.cabl.yuv", "1");
+            }
+        }
+    } else {
+        if (property_get("hw.cabl.yuv", property, NULL) > 0) {
+            if (atoi(property) != 0) {
+                property_set("hw.cabl.yuv", "0");
+            }
+        }
     }
 }
 
@@ -744,6 +661,7 @@ void setListStats(hwc_context_t *ctx,
     ctx->listStats[dpy].extOnlyLayerIndex = -1;
     ctx->listStats[dpy].isDisplayAnimating = false;
     ctx->listStats[dpy].secureUI = false;
+    ctx->mViewFrame[dpy] = (hwc_rect_t){0, 0, 0, 0};
 
     optimizeLayerRects(ctx, list, dpy);
 
@@ -751,6 +669,9 @@ void setListStats(hwc_context_t *ctx,
         hwc_layer_1_t const* layer = &list->hwLayers[i];
         private_handle_t *hnd = (private_handle_t *)layer->handle;
 
+        // Calculate view frame of each display from the layer displayframe
+        ctx->mViewFrame[dpy] = getUnion(ctx->mViewFrame[dpy],
+                                        layer->displayFrame);
 #ifdef QCOM_BSP
         if (layer->flags & HWC_SCREENSHOT_ANIMATOR_LAYER) {
             ctx->listStats[dpy].isDisplayAnimating = true;
@@ -791,6 +712,7 @@ void setListStats(hwc_context_t *ctx,
         }
     }
 
+    setYUVProp(ctx->listStats[dpy].yuvCount);
     if(dpy) {
         //uncomment the below code for testing purpose.
         /* char value[PROPERTY_VALUE_MAX];
@@ -806,9 +728,6 @@ void setListStats(hwc_context_t *ctx,
                      ctx->mExtOrientation, ctx->mBufferMirrorMode);
         }
     }
-    
-    if (dpy == HWC_DISPLAY_PRIMARY)
-        configurePPD(ctx, ctx->listStats[dpy].yuvCount);
 }
 
 
@@ -1091,9 +1010,6 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     int acquireFd[MAX_NUM_APP_LAYERS];
     int count = 0;
     int releaseFd = -1;
-#ifdef USE_RETIRE_FENCE
-    int retireFd = -1;
-#endif
     int fbFd = -1;
     int rotFd = -1;
     bool swapzero = false;
@@ -1108,9 +1024,6 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     }
     data.acq_fen_fd = acquireFd;
     data.rel_fen_fd = &releaseFd;
-#ifdef USE_RETIRE_FENCE
-    data.retire_fen_fd = &retireFd;
-#endif
 
     char property[PROPERTY_VALUE_MAX];
     if(property_get("debug.egl.swapinterval", property, "1") > 0) {
@@ -1150,8 +1063,9 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
 
     //Accumulate acquireFenceFds for MDP
     for(uint32_t i = 0; i < list->numHwLayers; i++) {
-        if(list->hwLayers[i].compositionType == HWC_OVERLAY &&
-                        (layerProp[i].mFlags & HWC_MDPCOMP) &&
+        if(((list->hwLayers[i].compositionType == HWC_OVERLAY &&
+                        (layerProp[i].mFlags & HWC_MDPCOMP)) ||
+                        list->hwLayers[i].compositionType == HWC_BLIT) &&
                         list->hwLayers[i].acquireFenceFd >= 0) {
             if(UNLIKELY(swapzero))
                 acquireFd[count++] = -1;
@@ -1194,6 +1108,7 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     for(uint32_t i = 0; i < list->numHwLayers; i++) {
         if(((list->hwLayers[i].compositionType == HWC_OVERLAY) &&
                 (layerProp[i].mFlags & HWC_MDPCOMP)) ||
+                list->hwLayers[i].compositionType == HWC_BLIT ||
                 list->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
             //Populate releaseFenceFds.
             if(UNLIKELY(swapzero)) {
@@ -1234,20 +1149,13 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         releaseFd = -1;
     }
 
-#ifdef USE_RETIRE_FENCE
-    close(releaseFd);
-    if(UNLIKELY(swapzero))
-        list->retireFenceFd = -1;
-    else
-        list->retireFenceFd = retireFd;
-#else
-    if(UNLIKELY(swapzero)) {
+    if(UNLIKELY(swapzero)){
         list->retireFenceFd = -1;
         close(releaseFd);
     } else {
         list->retireFenceFd = releaseFd;
     }
-#endif
+
     return ret;
 }
 
@@ -1436,7 +1344,6 @@ int configureLowRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
     eTransform orient = static_cast<eTransform>(transform);
     int downscale = 0;
     int rotFlags = ovutils::ROT_FLAGS_NONE;
-    bool forceRot = false;
     Whf whf(getWidth(hnd), getHeight(hnd),
             getMdpFormat(hnd->format), hnd->size);
 
@@ -1465,6 +1372,7 @@ int configureLowRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
     calcExtDisplayPosition(ctx, hnd, dpy, crop, dst,
                                            transform, orient);
 
+    bool forceRot = false;
     if(isYuvBuffer(hnd) && ctx->mMDP.version >= qdutils::MDP_V4_2 &&
        ctx->mMDP.version < qdutils::MDSS_V5) {
         downscale =  getDownscaleFactor(
@@ -1475,11 +1383,12 @@ int configureLowRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
         if(downscale) {
             rotFlags = ROT_DOWNSCALE_ENABLED;
         }
-        unsigned int& prevWidth = ctx->mPrevWHF[dpy].w;
-        unsigned int& prevHeight = ctx->mPrevWHF[dpy].h;
+
+        uint32_t& prevWidth = ctx->mPrevWHF[dpy].w;
+        uint32_t& prevHeight = ctx->mPrevWHF[dpy].h;
         if(prevWidth != (uint32_t)getWidth(hnd) ||
-               prevHeight != (uint32_t)getHeight(hnd)) {
-            uint32_t prevBufArea = (prevWidth * prevHeight);
+                prevHeight != (uint32_t)getHeight(hnd)) {
+            uint32_t prevBufArea = prevWidth * prevHeight;
             if(prevBufArea) {
                 forceRot = true;
             }
@@ -1500,7 +1409,6 @@ int configureLowRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
         if(configRotator(*rot, whf, origWhf,  mdpFlags, orient, downscale) < 0) {
         //Configure rotator for pre-rotation
             ALOGE("%s: configRotator failed!", __FUNCTION__);
-            ctx->mOverlay->clear(dpy);
             return -1;
         }
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
@@ -1519,7 +1427,6 @@ int configureLowRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
     if(configMdp(ctx->mOverlay, parg, orient, crop, dst, metadata, dest) < 0) {
         ALOGE("%s: commit failed for low res panel", __FUNCTION__);
-        ctx->mLayerRotMap[dpy]->reset();
         return -1;
     }
     return 0;
@@ -1570,11 +1477,25 @@ int configureHighRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
         }
     }
 
+    bool forceRot = false;
+    if(isYuvBuffer(hnd)) {
+        uint32_t& prevWidth = ctx->mPrevWHF[dpy].w;
+        uint32_t& prevHeight = ctx->mPrevWHF[dpy].h;
+        if(prevWidth != (uint32_t)getWidth(hnd) ||
+                prevHeight != (uint32_t)getHeight(hnd)) {
+            uint32_t prevBufArea = (prevWidth * prevHeight);
+            if(prevBufArea) {
+                forceRot = true;
+            }
+            prevWidth = (uint32_t)getWidth(hnd);
+            prevHeight = (uint32_t)getHeight(hnd);
+        }
+    }
 
     setMdpFlags(layer, mdpFlagsL, 0, transform);
     trimLayer(ctx, dpy, transform, crop, dst);
 
-    if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
+    if(isYuvBuffer(hnd) && ((transform & HWC_TRANSFORM_ROT_90) || forceRot)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         Whf origWhf(hnd->width, hnd->height,
@@ -1582,7 +1503,6 @@ int configureHighRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
         if(configRotator(*rot, whf, origWhf, mdpFlagsL, orient, downscale) < 0) {
         //Configure rotator for pre-rotation
             ALOGE("%s: configRotator failed!", __FUNCTION__);
-            ctx->mOverlay->clear(dpy);
             return -1;
         }
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
@@ -1681,10 +1601,29 @@ void LayerRotMap::reset() {
     mCount = 0;
 }
 
+void LayerRotMap::clear() {
+    RotMgr::getInstance()->markUnusedTop(mCount);
+    reset();
+}
+
 void LayerRotMap::setReleaseFd(const int& fence) {
     for(uint32_t i = 0; i < mCount; i++) {
         mRot[i]->setReleaseFd(dup(fence));
     }
+}
+
+int getSocIdFromSystem() {
+    FILE *device = NULL;
+    int soc_id = 0;
+    char  buffer[10];
+    int result;
+    device = fopen("/sys/devices/system/soc/soc0/id","r");
+    if(device != NULL) {
+        result = fread (buffer,1,4,device);
+        soc_id = atoi(buffer);
+        fclose(device);
+    }
+    return soc_id;
 }
 
 };//namespace qhwc
